@@ -130,7 +130,7 @@ func connectDB() *sql.DB {
 		dbURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, pass, host, port, dbname, sslmode)
 	}
 
-	db, err := sql.Open("postgres", dbURL)
+	db, err := sql.Open("postgres", dbURL+"&default_transaction_read_only=true")
 	if err != nil {
 		log.Fatal(err)
 	}
