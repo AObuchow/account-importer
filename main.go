@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -111,9 +112,13 @@ func userExists(userID string) bool {
 
 	var id string
 	err := db.QueryRow("SELECT id FROM users WHERE id = $1", userID).Scan(&id)
+	if err != nil {
+		fmt.Println(err)
+	}
 	return err == nil
 }
 
+// Connects to Postgres DB using env vars
 // Connects to Postgres DB using env vars
 func connectDB() *sql.DB {
 	dbURL := os.Getenv("DATABASE_URL")
@@ -124,13 +129,27 @@ func connectDB() *sql.DB {
 		pass := os.Getenv("DB_PASS")
 		dbname := os.Getenv("DB_NAME")
 		sslmode := os.Getenv("DB_SSLMODE")
-		if host == "" || port == "" || user == "" || dbname == "" {
-			log.Fatal("Missing required DB environment variables. Either set DATABASE_URL or DB_HOST, DB_PORT, DB_USER, DB_NAME (and optionally DB_PASSWORD and DB_SSLMODE)")
+		if sslmode == "" {
+			sslmode = "disable"
 		}
-		dbURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, pass, host, port, dbname, sslmode)
+		if host == "" || port == "" || user == "" || dbname == "" {
+			log.Fatal("Missing required DB environment variables. Either set DATABASE_URL or DB_HOST, DB_PORT, DB_USER, DB_NAME (and optionally DB_PASS and DB_SSLMODE)")
+		}
+
+		u := &url.URL{
+			Scheme: "postgres",
+			User:   url.UserPassword(user, pass),
+			Host:   fmt.Sprintf("%s:%s", host, port),
+			Path:   dbname,
+			RawQuery: url.Values{
+				"sslmode":                       []string{sslmode},
+				"default_transaction_read_only": []string{"true"},
+			}.Encode(),
+		}
+		dbURL = u.String()
 	}
 
-	db, err := sql.Open("postgres", dbURL+"&default_transaction_read_only=true")
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
