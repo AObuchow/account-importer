@@ -28,18 +28,24 @@ func main() {
 	}
 
 	var userID string
+	var err error
 
 	switch {
 	case *userIDFlag != "":
 		userID = *userIDFlag
+		if !userExists(userID) {
+			log.Fatalf("Could not find user_id %s in the database.", userID)
+		}
 	case *accountIDFlag != "":
-		var err error
 		userID, err = getUserIDFromAccountID(*accountIDFlag)
 		if err != nil {
-			log.Fatalf("Failed to retrieve user_id from account_id: %v", err)
+			log.Fatalf("Could not find user_id associated with account_id %s: %v", *accountIDFlag, err)
 		}
 	case len(flag.Args()) == 1:
 		userID = flag.Args()[0]
+		if !userExists(userID) {
+			log.Fatalf("Could not find user_id %s in the database.", userID)
+		}
 	default:
 		log.Fatal("Usage: go run main.go [--output=true] [--user_id=<id> | --account_id=<id>] <user_id>")
 	}
@@ -96,6 +102,16 @@ func getUserIDFromAccountID(accountID string) (string, error) {
 		return "", err
 	}
 	return userID, nil
+}
+
+// Verifies if the user_id exists in the users table
+func userExists(userID string) bool {
+	db := connectDB()
+	defer db.Close()
+
+	var id string
+	err := db.QueryRow("SELECT id FROM users WHERE id = $1", userID).Scan(&id)
+	return err == nil
 }
 
 // Connects to Postgres DB using env vars
