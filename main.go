@@ -20,7 +20,6 @@ var (
 	accountIDFlag = flag.String("account_id", "", "Specify an account_id to look up user_id")
 )
 
-// Entry point of the script
 func main() {
 	flag.Parse()
 
@@ -92,7 +91,6 @@ func main() {
 	}
 }
 
-// Retrieves user_id from an account_id by querying the DB
 func getUserIDFromAccountID(accountID string) (string, error) {
 	db := connectDB()
 	defer db.Close()
@@ -105,7 +103,6 @@ func getUserIDFromAccountID(accountID string) (string, error) {
 	return userID, nil
 }
 
-// Verifies if the user_id exists in the users table
 func userExists(userID string) bool {
 	db := connectDB()
 	defer db.Close()
@@ -113,13 +110,15 @@ func userExists(userID string) bool {
 	var id string
 	err := db.QueryRow("SELECT id FROM users WHERE id = $1", userID).Scan(&id)
 	if err != nil {
-		fmt.Println(err)
+		if err == sql.ErrNoRows {
+			log.Printf("No user found with user_id: %s", userID)
+		} else {
+			log.Printf("Error checking user existence: %v", err)
+		}
 	}
 	return err == nil
 }
 
-// Connects to Postgres DB using env vars
-// Connects to Postgres DB using env vars
 func connectDB() *sql.DB {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -161,17 +160,20 @@ func connectDB() *sql.DB {
 func generateInsertStatements(db *sql.DB, query string, table string, param string) (string, error) {
 	rows, err := db.Query(query, param)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("query for table %s failed: %w", table, err)
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get columns for table %s: %w", table, err)
 	}
 
 	var out strings.Builder
+	rowCount := 0
+
 	for rows.Next() {
+		rowCount++
 		rawResult := make([]interface{}, len(cols))
 		dest := make([]interface{}, len(cols))
 		for i := range rawResult {
@@ -179,7 +181,7 @@ func generateInsertStatements(db *sql.DB, query string, table string, param stri
 		}
 
 		if err := rows.Scan(dest...); err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to scan row for table %s: %w", table, err)
 		}
 
 		values := make([]string, len(cols))
@@ -199,6 +201,14 @@ func generateInsertStatements(db *sql.DB, query string, table string, param stri
 		}
 
 		out.WriteString(fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES (%s);\n", table, strings.Join(cols, ", "), strings.Join(values, ", ")))
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iteration error on table %s: %w", table, err)
+	}
+
+	if rowCount == 0 {
+		log.Printf("Note: No rows found for table %s with user_id = %s", table, param)
 	}
 
 	return out.String(), nil
