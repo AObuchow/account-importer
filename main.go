@@ -6,140 +6,170 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
-	
+	"time"
+
 	_ "github.com/lib/pq"
 )
 
-// Table-specific SQL queries to dump rows related to a user_id/account_id.
-var queries = map[string]string{
-	"accounts":          "SELECT * FROM accounts WHERE id = $1",
-	"users":             "SELECT * FROM users WHERE id = (SELECT user_id FROM accounts WHERE id = $1)",
-	"app_auth_tokens":   "SELECT * FROM app_auth_tokens WHERE user_id = (SELECT user_id FROM accounts WHERE id = $1)",
-	"user_identities":   "SELECT * FROM user_identities WHERE user_id = (SELECT user_id FROM accounts WHERE id = $1)",
-	"user_preferences":  "SELECT * FROM user_preferences WHERE user_id = (SELECT user_id FROM accounts WHERE id = $1)",
-}
+var (
+	outputToFile  = flag.Bool("output", false, "Write SQL to a .sql file")
+	userIDFlag    = flag.String("user_id", "", "Specify a user_id directly")
+	accountIDFlag = flag.String("account_id", "", "Specify an account_id to look up user_id")
+)
 
+// Entry point of the script
 func main() {
-	flagOutput := flag.Bool("output", false, "Write output to .sql file named after user_id")
 	flag.Parse()
 
-	if flag.NArg() != 1 {
-		log.Fatalf("Usage: %s [--output=true] <account_id>", os.Args[0])
+	if (*userIDFlag != "" && *accountIDFlag != "") || (len(flag.Args()) > 0 && (*userIDFlag != "" || *accountIDFlag != "")) {
+		log.Fatal("Provide either --user_id or --account_id, not both. Or pass a positional argument (assumed to be user_id by default).")
 	}
-	accountID := flag.Arg(0)
 
-	db := setupDB()
+	var userID string
+
+	switch {
+	case *userIDFlag != "":
+		userID = *userIDFlag
+	case *accountIDFlag != "":
+		var err error
+		userID, err = getUserIDFromAccountID(*accountIDFlag)
+		if err != nil {
+			log.Fatalf("Failed to retrieve user_id from account_id: %v", err)
+		}
+	case len(flag.Args()) == 1:
+		userID = flag.Args()[0]
+	default:
+		log.Fatal("Usage: go run main.go [--output=true] [--user_id=<id> | --account_id=<id>] <user_id>")
+	}
+
+	db := connectDB()
 	defer db.Close()
 
-	userID := lookupUserID(db, accountID)
+	queries := map[string]string{
+		"accounts":         "SELECT * FROM accounts WHERE user_id = $1",
+		"users":            "SELECT * FROM users WHERE id = $1",
+		"app_auth_tokens":  "SELECT * FROM app_auth_tokens WHERE user_id = $1",
+		"user_identities":  "SELECT * FROM user_identities WHERE user_id = $1",
+		"user_preferences": "SELECT * FROM user_preferences WHERE user_id = $1",
+	}
 
-	var file *os.File
-	if *flagOutput {
+	var output strings.Builder
+	sortedKeys := make([]string, 0, len(queries))
+	for k := range queries {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+
+	for _, table := range sortedKeys {
+		dump, err := generateInsertStatements(db, queries[table], table, userID)
+		if err != nil {
+			log.Printf("Warning: Skipping table %s due to error: %v", table, err)
+			continue
+		}
+		output.WriteString(fmt.Sprintf("-- Insert for %s\n", table))
+		output.WriteString(dump)
+		output.WriteString("\n")
+	}
+
+	fmt.Print(output.String())
+
+	if *outputToFile {
 		filename := fmt.Sprintf("user_%s_dump.sql", userID)
-		var err error
-		file, err = os.Create(filename)
+		err := os.WriteFile(filename, []byte(output.String()), 0644)
 		if err != nil {
-			log.Fatalf("Failed to create output file: %v", err)
+			log.Fatalf("Failed to write to file: %v", err)
 		}
-		defer file.Close()
-	}
-
-	// Generate and print INSERT statements for each table
-	for table, query := range queries {
-		runDump(db, query, table, accountID, file)
+		fmt.Printf("Wrote SQL output to %s\n", filename)
 	}
 }
 
-// setupDB reads DB connection info from env and returns a ready *sql.DB
-func setupDB() *sql.DB {
-	// Use DATABASE_URL if present
-	if url := os.Getenv("DATABASE_URL"); url != "" {
-		db, err := sql.Open("postgres", url)
-		if err != nil {
-			log.Fatalf("Failed to connect using DATABASE_URL: %v", err)
-		}
-		return db
-	}
+// Retrieves user_id from an account_id by querying the DB
+func getUserIDFromAccountID(accountID string) (string, error) {
+	db := connectDB()
+	defer db.Close()
 
-	// Otherwise fall back to individual env vars
-	host := os.Getenv("DB_HOST")
-	port := os.Getenv("DB_PORT")
-	user := os.Getenv("DB_USER")
-	pass := os.Getenv("DB_PASS")
-	name := os.Getenv("DB_NAME")
-	ssl := os.Getenv("DB_SSLMODE")
-
-	if host == "" || port == "" || user == "" || name == "" {
-		log.Fatal("Missing required DB environment variables. Either set DATABASE_URL or DB_HOST, DB_PORT, DB_USER, DB_NAME (and optionally DB_PASSWORD)")
-	}
-
-	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s", host, port, user, pass, name, ssl)
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("Failed to connect to DB: %v", err)
-	}
-	return db
-}
-
-// lookupUserID extracts the user_id from the accounts table for a given account_id
-func lookupUserID(db *sql.DB, accountID string) string {
 	var userID string
 	err := db.QueryRow("SELECT user_id FROM accounts WHERE id = $1", accountID).Scan(&userID)
 	if err != nil {
-		log.Fatalf("Failed to look up user_id: %v", err)
+		return "", err
 	}
-	return userID
+	return userID, nil
 }
 
-// runDump executes a query and prints INSERT statements for each row found
-func runDump(db *sql.DB, query, table, param string, file *os.File) {
+// Connects to Postgres DB using env vars
+func connectDB() *sql.DB {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		host := os.Getenv("DB_HOST")
+		port := os.Getenv("DB_PORT")
+		user := os.Getenv("DB_USER")
+		pass := os.Getenv("DB_PASS")
+		dbname := os.Getenv("DB_NAME")
+		sslmode := os.Getenv("DB_SSLMODE")
+		if host == "" || port == "" || user == "" || dbname == "" {
+			log.Fatal("Missing required DB environment variables. Either set DATABASE_URL or DB_HOST, DB_PORT, DB_USER, DB_NAME (and optionally DB_PASSWORD and DB_SSLMODE)")
+		}
+		dbURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, pass, host, port, dbname, sslmode)
+	}
+
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return db
+}
+
+// Generates INSERT statements for a table given the user_id parameter
+func generateInsertStatements(db *sql.DB, query string, table string, param string) (string, error) {
 	rows, err := db.Query(query, param)
 	if err != nil {
-		log.Fatalf("Query for table %s failed: %v", table, err)
+		return "", err
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		log.Fatalf("Failed to get columns: %v", err)
+		return "", err
 	}
 
-	// Loop through each row and print formatted INSERT
+	var out strings.Builder
 	for rows.Next() {
-		raw := make([]interface{}, len(cols))
+		rawResult := make([]interface{}, len(cols))
 		dest := make([]interface{}, len(cols))
-		for i := range raw {
-			dest[i] = &raw[i]
+		for i := range rawResult {
+			dest[i] = &rawResult[i]
 		}
-		err := rows.Scan(dest...)
-		if err != nil {
-			log.Fatalf("Scan failed: %v", err)
+
+		if err := rows.Scan(dest...); err != nil {
+			return "", err
 		}
 
 		values := make([]string, len(cols))
-		for i, val := range raw {
-			switch v := val.(type) {
+		for i, raw := range rawResult {
+			switch val := raw.(type) {
 			case nil:
 				values[i] = "NULL"
 			case bool:
-				values[i] = fmt.Sprintf("%t", v)
+				values[i] = fmt.Sprintf("%t", val)
 			case []byte:
-				values[i] = fmt.Sprintf("'%s'", escapeSingleQuotes(string(v)))
+				values[i] = fmt.Sprintf("'%s'", escapeSingleQuotes(string(val)))
+			case time.Time:
+				values[i] = fmt.Sprintf("'%s'", val.UTC().Format("2006-01-02T15:04:05Z"))
 			default:
-				values[i] = fmt.Sprintf("'%v'", v)
+				values[i] = fmt.Sprintf("'%v'", val)
 			}
 		}
 
-		stmt := fmt.Sprintf("-- Insert for %s\nINSERT INTO \"%s\" (%s) VALUES (%s);\n\n", table, table, strings.Join(cols, ", "), strings.Join(values, ", "))
-		fmt.Print(stmt)
-		if file != nil {
-			file.WriteString(stmt)
-		}
+		out.WriteString(fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES (%s);\n", table, strings.Join(cols, ", "), strings.Join(values, ", ")))
 	}
+
+	return out.String(), nil
 }
 
-// escapeSingleQuotes escapes single quotes for SQL compatibility
+// Escapes single quotes in string values for SQL safety
 func escapeSingleQuotes(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
