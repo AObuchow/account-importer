@@ -1,4 +1,4 @@
-module github.com/timehop/account-importer
+module github.com/timehop/user-dump
 
 go 1.23.4
 
