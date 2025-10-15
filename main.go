@@ -79,6 +79,24 @@ func main() {
 		output.WriteString("\n")
 	}
 
+	// Handle dropbox_folders separately since it depends on accounts table
+	// Assumption: Users have at most one DropboxAccount. If multiple exist,
+	// only the first one will be processed.
+	dropboxAccountID, err := getDropboxAccountID(db, userID)
+	if err == nil {
+		// DropboxAccount found, query dropbox_folders table
+		dump, err := generateInsertStatements(db, "SELECT * FROM dropbox_folders WHERE dropbox_account_id = $1", "dropbox_folders", dropboxAccountID)
+		if err != nil {
+			log.Printf("Warning: Skipping table dropbox_folders due to error: %v", err)
+		} else {
+			output.WriteString("-- Insert for dropbox_folders\n")
+			output.WriteString(dump)
+			output.WriteString("\n")
+		}
+	} else if err != sql.ErrNoRows {
+		log.Printf("Warning: Error checking for DropboxAccount: %v", err)
+	}
+
 	fmt.Print(output.String())
 
 	if *outputToFile {
@@ -101,6 +119,12 @@ func getUserIDFromAccountID(accountID string) (string, error) {
 		return "", err
 	}
 	return userID, nil
+}
+
+func getDropboxAccountID(db *sql.DB, userID string) (string, error) {
+	var dropboxAccountID string
+	err := db.QueryRow("SELECT id FROM accounts WHERE user_id = $1 AND type = 'DropboxAccount'", userID).Scan(&dropboxAccountID)
+	return dropboxAccountID, err
 }
 
 func userExists(userID string) bool {
